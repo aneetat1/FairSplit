@@ -7,11 +7,19 @@ contract FairSplit {
     address public immutable creator;
     bool public initialized;
     bool public closed;
+    bool public active;
     string public purpose;
     address[] public members;
     mapping(address => bool) public isMember;
     mapping(address => bool) public hasContributed;
     mapping(address => bool) public refundClaimed;
+    mapping(address => bool) public hasVotedToProceed;
+    uint256 public proceedApprovals;
+    uint256 public proceedRejections;
+    uint256 public closeApprovals;
+    // Each contribution changes the voting group, so closure votes start fresh.
+    uint256 public closeVotingRound;
+    mapping(address => uint256) private lastCloseVoteRound;
 
     uint256 public contributionAmount;
     uint256 public fundingDeadline;
@@ -41,6 +49,10 @@ contract FairSplit {
     event ExpensePaid(uint256 indexed id, uint256 amount);
     event PoolClosed(uint256 remainingBalance, uint256 refundPerMember);
     event RefundPaid(address indexed member, uint256 amount);
+    event ProceedVoteCast(address indexed member, bool approve);
+    event PoolActivated(uint256 memberCount, uint256 approvalsRequired);
+    event CloseVoteCast(address indexed member, uint256 approvals, uint256 requiredApprovals);
+    event CloseVoteReset(uint256 indexed round);
 
     constructor() {
         creator = msg.sender;
@@ -61,7 +73,7 @@ contract FairSplit {
     modifier activePool() {
         require(initialized && !closed, "Pool unavailable");
         require(block.timestamp < endTime, "Pool has ended");
-        require(contributorCount == members.length, "Not fully funded");
+        require(active, "Pool not activated");
         _;
     }
 
@@ -96,6 +108,7 @@ contract FairSplit {
         fundingDeadline = block.timestamp + fundingDurationSeconds;
         endTime = block.timestamp + poolDurationSeconds;
         initialized = true;
+        closeVotingRound = 1;
         emit PoolCreated(poolPurpose, members.length);
     }
 
@@ -106,9 +119,55 @@ contract FairSplit {
         require(msg.value == contributionAmount, "Send exact contribution");
         hasContributed[msg.sender] = true;
         contributorCount++;
+        closeVotingRound++;
+        closeApprovals = 0;
+        emit CloseVoteReset(closeVotingRound);
         poolBalance += msg.value;
         if (remainderRecipient == address(0)) remainderRecipient = msg.sender;
         emit Contribution(msg.sender, msg.value);
+        // A fully funded pool can start immediately, without a continuation vote.
+        if (contributorCount == members.length) {
+            active = true;
+            emit PoolActivated(members.length, approvalThreshold);
+        }
+    }
+
+    // After funding closes, only contributors vote on proceeding with fewer members.
+    // One final vote each; a strict majority of ALL contributors must approve.
+    // The vote expires at endTime; no spending is possible before activation.
+    function voteToProceed(bool approve) external nonReentrant onlyMember {
+        require(initialized && !closed && !active, "Vote unavailable");
+        require(block.timestamp >= fundingDeadline, "Funding still open");
+        require(block.timestamp < endTime, "Voting expired");
+        require(contributorCount >= 2, "Need at least two contributors");
+        require(hasContributed[msg.sender], "Contributors only");
+        require(!hasVotedToProceed[msg.sender], "Already voted");
+        uint256 needed = contributorCount / 2 + 1;
+        require(proceedRejections <= contributorCount - needed, "Continuation rejected");
+
+        hasVotedToProceed[msg.sender] = true;
+        if (approve) proceedApprovals++;
+        else proceedRejections++;
+        emit ProceedVoteCast(msg.sender, approve);
+
+        if (proceedApprovals >= needed) {
+            // Compact the bounded member list, preserving contributor order.
+            uint256 paidIndex;
+            uint256 originalLength = members.length;
+            for (uint256 i; i < originalLength; i++) {
+                address member = members[i];
+                if (hasContributed[member]) {
+                    members[paidIndex] = member;
+                    paidIndex++;
+                } else {
+                    isMember[member] = false;
+                }
+            }
+            while (members.length > paidIndex) members.pop();
+            approvalThreshold = needed;
+            active = true;
+            emit PoolActivated(members.length, approvalThreshold);
+        }
     }
 
     // ANEETA: propose, approve/reject, and execute shared expenses.
@@ -147,14 +206,55 @@ contract FairSplit {
         emit ExpensePaid(id, expense.amount);
     }
 
-    // JOCELYN: deadline-based closure and individual refund withdrawals.
-    // Anyone can finalize closure after the relevant deadline.
-    // If funding fails, spending was never enabled; contributors get deposits back.
+    // JOCELYN: early closure voting, deadline closure, and refund withdrawals.
+    // Before activation, only paid contributors count; after activation, these
+    // are all active members. A sole contributor may cancel their own deposit.
+    // Calling this function approves closure. Each contributor gets one vote
+    // per round; votes reset whenever a new contribution changes the group.
+    function voteToClose() external nonReentrant onlyMember {
+        require(initialized && !closed, "Pool unavailable");
+        require(block.timestamp < endTime, "Use closePool after end time");
+        require(hasContributed[msg.sender], "Contributors only");
+        require(!hasVotedToClose(msg.sender), "Already voted to close");
+        lastCloseVoteRound[msg.sender] = closeVotingRound;
+        closeApprovals++;
+        uint256 needed = closeApprovalThreshold();
+        emit CloseVoteCast(msg.sender, closeApprovals, needed);
+        // The deciding vote closes immediately, enabling individual refunds.
+        if (closeApprovals >= needed) _closePool();
+    }
+
+    function hasVotedToClose(address member) public view returns (bool) {
+        return initialized && lastCloseVoteRound[member] == closeVotingRound;
+    }
+
+    function closeApprovalThreshold() public view returns (uint256) {
+        if (contributorCount == 0) return 0;
+        return contributorCount / 2 + 1;
+    }
+
+    // Anyone may close at endTime, including if a continuation vote expires.
+    // Earlier refunds are available if fewer than two paid, or enough contributors
+    // rejected continuation that a majority approval is mathematically impossible.
     function closePool() external nonReentrant {
         require(initialized && !closed, "Pool unavailable");
-        bool fundingFailed = block.timestamp >= fundingDeadline && contributorCount < members.length;
-        require(fundingFailed || block.timestamp >= endTime, "Too early to close");
+        bool cannotProceed;
+        if (!active && block.timestamp >= fundingDeadline) {
+            if (contributorCount < 2) {
+                cannotProceed = true;
+            } else {
+                uint256 needed = contributorCount / 2 + 1;
+                cannotProceed = proceedRejections > contributorCount - needed;
+            }
+        }
+        require(cannotProceed || block.timestamp >= endTime, "Too early to close");
+        _closePool();
+    }
+
+    // Both closure paths freeze spending and snapshot refund shares here.
+    function _closePool() internal {
         closed = true;
+        active = false;
         if (contributorCount > 0) {
             refundPerMember = poolBalance / contributorCount;
             refundRemainder = poolBalance % contributorCount;
