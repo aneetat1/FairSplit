@@ -17,9 +17,7 @@ contract FairSplit {
     uint256 public proceedApprovals;
     uint256 public proceedRejections;
     uint256 public closeApprovals;
-    // Each contribution changes the voting group, so closure votes start fresh.
-    uint256 public closeVotingRound;
-    mapping(address => uint256) private lastCloseVoteRound;
+    mapping(address => bool) public hasVotedToClose;
 
     uint256 public contributionAmount;
     uint256 public fundingDeadline;
@@ -52,7 +50,6 @@ contract FairSplit {
     event ProceedVoteCast(address indexed member, bool approve);
     event PoolActivated(uint256 memberCount, uint256 approvalsRequired);
     event CloseVoteCast(address indexed member, uint256 approvals, uint256 requiredApprovals);
-    event CloseVoteReset(uint256 indexed round);
 
     constructor() {
         creator = msg.sender;
@@ -108,7 +105,6 @@ contract FairSplit {
         fundingDeadline = block.timestamp + fundingDurationSeconds;
         endTime = block.timestamp + poolDurationSeconds;
         initialized = true;
-        closeVotingRound = 1;
         emit PoolCreated(poolPurpose, members.length);
     }
 
@@ -119,9 +115,6 @@ contract FairSplit {
         require(msg.value == contributionAmount, "Send exact contribution");
         hasContributed[msg.sender] = true;
         contributorCount++;
-        closeVotingRound++;
-        closeApprovals = 0;
-        emit CloseVoteReset(closeVotingRound);
         poolBalance += msg.value;
         if (remainderRecipient == address(0)) remainderRecipient = msg.sender;
         emit Contribution(msg.sender, msg.value);
@@ -170,7 +163,7 @@ contract FairSplit {
         }
     }
 
-    // ANEETA: propose, approve/reject, and execute shared expenses.
+    // ANEETA: propose, approve/reject, and execute sh ared expenses.
     function proposeExpense(address payable recipient, uint256 amount, string calldata description)
         external nonReentrant onlyMember activePool returns (uint256 id)
     {
@@ -207,25 +200,22 @@ contract FairSplit {
     }
 
     // JOCELYN: early closure voting, deadline closure, and refund withdrawals.
-    // Before activation, only paid contributors count; after activation, these
-    // are all active members. A sole contributor may cancel their own deposit.
-    // Calling this function approves closure. Each contributor gets one vote
-    // per round; votes reset whenever a new contribution changes the group.
+    // Voting opens after funding ends, or earlier if everyone has paid.
+    // Only paid contributors count; after activation these are all active members.
+    // The electorate is fixed once voting opens. Each contributor gets one vote.
+    // Closure also prevents approved-but-unexecuted expenses from being paid.
     function voteToClose() external nonReentrant onlyMember {
         require(initialized && !closed, "Pool unavailable");
+        require(block.timestamp >= fundingDeadline || active, "Funding still open");
         require(block.timestamp < endTime, "Use closePool after end time");
         require(hasContributed[msg.sender], "Contributors only");
-        require(!hasVotedToClose(msg.sender), "Already voted to close");
-        lastCloseVoteRound[msg.sender] = closeVotingRound;
+        require(!hasVotedToClose[msg.sender], "Already voted to close");
+        hasVotedToClose[msg.sender] = true;
         closeApprovals++;
         uint256 needed = closeApprovalThreshold();
         emit CloseVoteCast(msg.sender, closeApprovals, needed);
         // The deciding vote closes immediately, enabling individual refunds.
         if (closeApprovals >= needed) _closePool();
-    }
-
-    function hasVotedToClose(address member) public view returns (bool) {
-        return initialized && lastCloseVoteRound[member] == closeVotingRound;
     }
 
     function closeApprovalThreshold() public view returns (uint256) {
