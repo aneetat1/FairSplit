@@ -163,7 +163,7 @@ contract FairSplit {
         }
     }
 
-    // ANEETA: propose, approve/reject, and execute sh ared expenses.
+    // ANEETA: propose, approve/reject, and execute shared expenses.
     function proposeExpense(address payable recipient, uint256 amount, string calldata description)
         external nonReentrant onlyMember activePool returns (uint256 id)
     {
